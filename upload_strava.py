@@ -23,6 +23,7 @@ Flaggor:
 import argparse
 import bisect
 import datetime as dt
+import http.client
 import http.server
 import json
 import sys
@@ -57,29 +58,50 @@ MATCH_START_DIFF = 10 * 60
 MATCH_OVERLAP = 0.5
 
 
+NETWORK_RETRIES = 5
+
+
 class RateLimited(Exception):
     pass
 
 
+class NetworkError(Exception):
+    pass
+
+
 def request(method, url, token=None, data=None, headers=None):
+    """Gör ett API-anrop. GET/PUT görs om vid nätverksfel och serverfel (5xx);
+    POST görs inte om, eftersom ett anrop som tajmat ut ändå kan ha skapat aktiviteten."""
     headers = dict(headers or {})
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if isinstance(data, dict):
         data = urllib.parse.urlencode(data).encode()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return r.status, json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            raise RateLimited(e.headers.get("X-RateLimit-Usage", ""))
-        body = e.read()
+    attempts = NETWORK_RETRIES if method in ("GET", "PUT") else 1
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            return e.code, json.loads(body)
-        except ValueError:
-            return e.code, {"message": body.decode(errors="replace")}
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise RateLimited(e.headers.get("X-RateLimit-Usage", ""))
+            body = e.read()
+            if e.code < 500 or attempt == attempts:
+                try:
+                    return e.code, json.loads(body)
+                except ValueError:
+                    return e.code, {"message": body.decode(errors="replace")}
+            problem = f"HTTP {e.code}"
+        except (OSError, http.client.HTTPException) as e:
+            # TimeoutError, URLError, ConnectionResetError, IncompleteRead m.fl.
+            if attempt == attempts:
+                raise NetworkError(f"{type(e).__name__}: {e}") from e
+            problem = f"{type(e).__name__}: {e}"
+        wait = 10 * 2 ** (attempt - 1)
+        print(f"  Nätverksfel ({problem}); försöker igen om {wait} s ({attempt}/{attempts - 1}) ...", flush=True)
+        time.sleep(wait)
 
 
 def authorize(client_id, client_secret):
@@ -201,8 +223,11 @@ def fetch_existing(tok):
     """Hämtar alla aktiviteter som redan finns på Strava-kontot."""
     existing, page = [], 1
     while True:
-        status, acts = with_rate_limit(request, "GET", f"{API}/athlete/activities?per_page=200&page={page}",
-                                       access_token(tok))
+        try:
+            status, acts = with_rate_limit(request, "GET", f"{API}/athlete/activities?per_page=200&page={page}",
+                                           access_token(tok))
+        except NetworkError as e:
+            sys.exit(f"Kunde inte hämta befintliga aktiviteter ({e}). Kontrollera nätverket och kör igen.")
         if status != 200:
             sys.exit(f"Kunde inte hämta befintliga aktiviteter: {acts}")
         if not acts:
@@ -296,7 +321,11 @@ def main():
         return
 
     for n, act in enumerate(todo, 1):
-        res = with_rate_limit(upload_file if act["file"] else create_manual, tok, act)
+        try:
+            res = with_rate_limit(upload_file if act["file"] else create_manual, tok, act)
+        except NetworkError as e:
+            # Anropet kan ha gått igenom ändå; dubblettkollen vid nästa körning fångar det.
+            res = {"status": "error", "error": str(e)}
         state[act["id"]] = res
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"[{n}/{len(todo)}] {act['start_local']} {act['name']}: {res['status']}"
