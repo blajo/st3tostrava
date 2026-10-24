@@ -1,2 +1,2 @@
 # st3tostrava
-Extracts a SportTracks (.st3) logbook and transfer to Strava.
+Extracts a SportTracks 3 logbook (.logbook3) and transfer to Strava.
