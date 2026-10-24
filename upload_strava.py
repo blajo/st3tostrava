@@ -62,7 +62,25 @@ NETWORK_RETRIES = 5
 
 
 class RateLimited(Exception):
-    pass
+    def __init__(self, headers):
+        self.headers = headers
+        super().__init__(", ".join(f"{h} {headers.get(h)}" for h in
+                                   ("X-RateLimit-Usage", "X-RateLimit-Limit",
+                                    "X-ReadRateLimit-Usage", "X-ReadRateLimit-Limit") if headers.get(h)))
+
+    def daily_exceeded(self):
+        """Sant om dygnsgränsen (totalt eller för läsanrop) är nådd.
+        Headervärdena är "per 15 min,per dygn"."""
+        for usage_h, limit_h in (("X-RateLimit-Usage", "X-RateLimit-Limit"),
+                                 ("X-ReadRateLimit-Usage", "X-ReadRateLimit-Limit")):
+            try:
+                usage = int(self.headers.get(usage_h).split(",")[1])
+                limit = int(self.headers.get(limit_h).split(",")[1])
+            except (AttributeError, IndexError, ValueError):
+                continue
+            if usage >= limit:
+                return True
+        return False
 
 
 class NetworkError(Exception):
@@ -86,7 +104,7 @@ def request(method, url, token=None, data=None, headers=None):
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                raise RateLimited(e.headers.get("X-RateLimit-Usage", ""))
+                raise RateLimited(e.headers)
             body = e.read()
             if e.code < 500 or attempt == attempts:
                 try:
@@ -175,7 +193,8 @@ def upload_file(tok, act):
     status, up = request("POST", f"{API}/uploads", access_token(tok), body, {"Content-Type": ctype})
     if status >= 400:
         return {"status": "error", "error": up}
-    for _ in range(30):
+    # Strava behöver normalt några sekunder; varje statuskoll räknas mot rate limit.
+    for poll in range(25):
         if up.get("activity_id"):
             break
         if up.get("error"):
@@ -183,13 +202,15 @@ def upload_file(tok, act):
             if "duplicate" in err.lower():
                 return {"status": "duplicate", "error": err}
             return {"status": "error", "error": err}
-        time.sleep(3)
-        _, up = request("GET", f"{API}/uploads/{up['id']}", access_token(tok))
+        time.sleep(8 if poll == 0 else 5)
+        upload_id = up["id"]
+        _, up = with_rate_limit(lambda: request("GET", f"{API}/uploads/{upload_id}", access_token(tok)))
     else:
         return {"status": "pending", "upload_id": up.get("id")}
     aid = up["activity_id"]
     if act["sport_type"] in FIX_SPORT:
-        request("PUT", f"{API}/activities/{aid}", access_token(tok), {"sport_type": act["sport_type"]})
+        with_rate_limit(lambda: request("PUT", f"{API}/activities/{aid}", access_token(tok),
+                                        {"sport_type": act["sport_type"]}))
     return {"status": "done", "activity_id": aid}
 
 
@@ -214,8 +235,14 @@ def with_rate_limit(fn, *args):
         try:
             return fn(*args)
         except RateLimited as e:
-            wait = 15 * 60 - time.time() % (15 * 60) + 10
-            print(f"  Rate limit nådd (användning {e}); väntar {wait / 60:.0f} min ...", flush=True)
+            # Strava nollställer kvartsgränsen vid :00/:15/:30/:45 och dygnsgränsen vid midnatt UTC.
+            if e.daily_exceeded():
+                wait = 86400 - time.time() % 86400 + 60
+                resume = dt.datetime.fromtimestamp(time.time() + wait).strftime("%Y-%m-%d %H:%M")
+                print(f"  Dygnsgränsen hos Strava är nådd ({e}); väntar till {resume} ...", flush=True)
+            else:
+                wait = 15 * 60 - time.time() % (15 * 60) + 10
+                print(f"  Kvartsgränsen hos Strava är nådd ({e}); väntar {wait / 60:.0f} min ...", flush=True)
             time.sleep(wait)
 
 
